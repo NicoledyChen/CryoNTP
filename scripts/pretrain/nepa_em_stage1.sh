@@ -19,7 +19,7 @@ CONFIG="configs/pretrain/nepa-base-patch14-em"
 OUTPUT_DIR="/data/ckpt/em_stage1"
 
 # ---------- Hardware ----------
-NUM_GPUS=4                           # number of GPUs
+NUM_GPUS=8                           # number of GPUs
 
 # ---------- Tile ----------
 TILE_SIZE=224                        # tile edge in pixels  (224/14 = 16×16 = 256 patches)
