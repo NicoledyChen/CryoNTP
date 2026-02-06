@@ -23,11 +23,11 @@
 set -euo pipefail
 
 # ---------- Paths ----------
-DATA_DIR="./data/em_train"
-VAL_DIR="./data/em_val"
+DATA_DIR="/data/em_nepa/train"               # 8,823 training micrographs
+VAL_DIR="/data/em_nepa/val"                  # 976 validation micrographs
 CONFIG="configs/pretrain/nepa-base-patch14-em"
-STAGE1_CKPT="./checkpoints/em_stage1"       # Stage 1 output
-BASE_OUTPUT="./checkpoints/em_stage2"
+STAGE1_CKPT="/data/ckpt/em_stage1"           # Stage 1 output
+BASE_OUTPUT="/data/ckpt/em_stage2"
 
 # ---------- Hardware ----------
 NUM_GPUS=4

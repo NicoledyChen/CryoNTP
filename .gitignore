@@ -16,6 +16,6 @@ viz_output/
 *.ipynb
 *.safetensors
 *.ckpt
-# *.sh  # keep shell scripts in repo
+*.sh
 
 **/.ipynb_checkpoints/

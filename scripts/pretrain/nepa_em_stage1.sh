@@ -13,10 +13,10 @@
 set -euo pipefail
 
 # ---------- Paths ----------
-DATA_DIR="./data/em_train"           # training images (recursively scanned)
-VAL_DIR="./data/em_val"              # validation images (optional, set "" to skip)
+DATA_DIR="/data/em_nepa/train"       # 8,823 training micrographs
+VAL_DIR="/data/em_nepa/val"          # 976 validation micrographs
 CONFIG="configs/pretrain/nepa-base-patch14-em"
-OUTPUT_DIR="./checkpoints/em_stage1"
+OUTPUT_DIR="/data/ckpt/em_stage1"
 
 # ---------- Hardware ----------
 NUM_GPUS=4                           # number of GPUs
