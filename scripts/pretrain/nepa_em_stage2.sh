@@ -123,7 +123,8 @@ for PHASE in "${PHASES[@]}"; do
         --pos_embed_rescale 3.0 \
         --visualize_embeddings \
         --vis_every_steps 200 \
-        --vis_n_samples 2000
+        --vis_n_samples 2000 \
+        --vis_attention_batch_size 1
 
     PREV_CKPT="${OUTPUT_DIR}"
 done

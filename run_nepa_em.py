@@ -605,6 +605,7 @@ class EmbeddingVisCallback(transformers.TrainerCallback):
         enable_attention_maps: bool = True,
         attention_n_samples: int = 8,
         attention_last_n_layers: int = 4,
+        attention_batch_size: int = 1,
     ):
         super().__init__()
         self.val_dataset = val_dataset
@@ -613,6 +614,7 @@ class EmbeddingVisCallback(transformers.TrainerCallback):
         self.enable_attention_maps = enable_attention_maps
         self.attention_n_samples = attention_n_samples
         self.attention_last_n_layers = attention_last_n_layers
+        self.attention_batch_size = attention_batch_size
 
     @staticmethod
     def _sample_indices(dataset_len: int, n: int, seed: int) -> list[int]:
@@ -756,7 +758,7 @@ class EmbeddingVisCallback(transformers.TrainerCallback):
         is_causal = bool(getattr(vit.config, "is_causal", False))
 
         records = []
-        batch_size = 8
+        batch_size = max(1, self.attention_batch_size)
         for start in range(0, len(indices), batch_size):
             batch_idx = indices[start : start + batch_size]
             pixels = torch.stack([
@@ -1065,6 +1067,10 @@ class DataTrainingArguments:
         default=4,
         metadata={"help": "Average attention over the last N transformer layers for heatmaps."},
     )
+    vis_attention_batch_size: int = field(
+        default=1,
+        metadata={"help": "Batch size for attention-map extraction."},
+    )
 
 
 @dataclass
@@ -1284,12 +1290,14 @@ def main():
                 enable_attention_maps=data_args.vis_attention_maps,
                 attention_n_samples=data_args.vis_attention_n_samples,
                 attention_last_n_layers=data_args.vis_attention_last_n_layers,
+                attention_batch_size=data_args.vis_attention_batch_size,
             )
         )
         logger.info(
             f"Embedding visualisation enabled: every {data_args.vis_every_steps} steps, "
             f"{data_args.vis_n_samples} samples, attention_maps={data_args.vis_attention_maps} "
-            f"(n={data_args.vis_attention_n_samples}, last_layers={data_args.vis_attention_last_n_layers}) "
+            f"(n={data_args.vis_attention_n_samples}, last_layers={data_args.vis_attention_last_n_layers}, "
+            f"attn_bs={data_args.vis_attention_batch_size}) "
             f"→ {{output_dir}}/vis/"
         )
 
