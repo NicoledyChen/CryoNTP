@@ -107,19 +107,22 @@ for PHASE in "${PHASES[@]}"; do
         --do_train \
         --do_eval \
         --eval_strategy steps \
-        --eval_steps 1000 \
+        --eval_steps 200 \
         --bf16 \
         --tf32 true \
         --dataloader_num_workers ${WORKERS} \
         --dataloader_prefetch_factor ${PREFETCH} \
         --dataloader_persistent_workers true \
         --save_strategy steps \
-        --save_steps 1000 \
-        --save_total_limit 2 \
+        --save_steps 200 \
+        --save_total_limit 5 \
         --logging_steps 50 \
         --report_to wandb \
         --overwrite_output_dir \
-        --pos_embed_rescale 3.0
+        --pos_embed_rescale 3.0 \
+        --visualize_embeddings \
+        --vis_every_steps 200 \
+        --vis_n_samples 2000
 
     PREV_CKPT="${OUTPUT_DIR}"
 done
