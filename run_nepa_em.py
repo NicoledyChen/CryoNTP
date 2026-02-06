@@ -744,43 +744,44 @@ class EmbeddingVisCallback(transformers.TrainerCallback):
         # ---- Save locally ----
         vis_dir = os.path.join(output_dir, "vis")
         os.makedirs(vis_dir, exist_ok=True)
-        local_path = os.path.join(vis_dir, f"embeddings_step{step}.png")
-        fig.savefig(local_path, dpi=150, bbox_inches="tight")
-        logger.info(f"Saved embedding plot → {local_path}")
+        combined_path = os.path.join(vis_dir, f"embeddings_step{step}.png")
+        fig.savefig(combined_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"Saved embedding plot → {combined_path}")
 
-        # ---- Log to wandb ----
+        # Save individual projection PNGs
+        individual_paths: dict[str, str] = {}
+        for method, coords in projections.items():
+            fig_single, ax_single = plt.subplots(1, 1, figsize=(10, 8))
+            self._make_scatter(
+                ax_single, coords, labels, unique_labels,
+                cmap, label_to_idx,
+                title=f"{method} — step {step}",
+            )
+            ax_single.legend(
+                loc="center left", bbox_to_anchor=(1.02, 0.5),
+                markerscale=3, fontsize=7, ncol=1,
+            )
+            fig_single.tight_layout()
+            safe_name = method.lower().replace("-", "_")
+            single_path = os.path.join(vis_dir, f"{safe_name}_step{step}.png")
+            fig_single.savefig(single_path, dpi=150, bbox_inches="tight")
+            plt.close(fig_single)
+            individual_paths[safe_name] = single_path
+
+        # ---- Log to wandb (use saved file paths, not fig objects) ----
         try:
             import wandb
             if wandb.run is not None:
-                wandb.log(
-                    {"val/embedding_plot": wandb.Image(fig)},
-                    step=step,
-                )
-                # Also log individual projections as separate wandb images
-                for method, coords in projections.items():
-                    fig_single, ax_single = plt.subplots(1, 1, figsize=(10, 8))
-                    self._make_scatter(
-                        ax_single, coords, labels, unique_labels,
-                        cmap, label_to_idx,
-                        title=f"{method} — step {step}",
-                    )
-                    ax_single.legend(
-                        loc="center left", bbox_to_anchor=(1.02, 0.5),
-                        markerscale=3, fontsize=7, ncol=1,
-                    )
-                    fig_single.tight_layout()
-                    wandb.log(
-                        {f"val/embedding_{method.lower().replace('-', '_')}": wandb.Image(fig_single)},
-                        step=step,
-                    )
-                    plt.close(fig_single)
-                logger.info(f"Logged embeddings to wandb (step {step})")
+                log_dict = {"val/embedding_plot": wandb.Image(combined_path)}
+                for safe_name, path in individual_paths.items():
+                    log_dict[f"val/embedding_{safe_name}"] = wandb.Image(path)
+                wandb.log(log_dict, step=step)
+                logger.info(f"Logged {len(log_dict)} images to wandb (step {step})")
         except ImportError:
             pass
         except Exception as e:
             logger.warning(f"Failed to log to wandb: {e}")
-
-        plt.close(fig)
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
         if state.global_step % self.every_steps != 0 or state.global_step == 0:

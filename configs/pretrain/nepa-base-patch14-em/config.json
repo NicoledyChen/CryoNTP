@@ -4,7 +4,7 @@
     "ViTNepaForPreTraining"
   ],
   "attention_probs_dropout_prob": 0.0,
-  "drop_path_prob": 0.1,
+  "drop_path_prob": 0.0,
   "dtype": "float32",
   "hidden_act": "gelu",
   "hidden_dropout_prob": 0.0,
@@ -22,7 +22,7 @@
   "patch_size": 14,
   "pos_embed_jitter": null,
   "pos_embed_rescale": 3.0,
-  "pos_embed_shift": 0.1,
+  "pos_embed_shift": null,
   "qk_norm": true,
   "qk_norm_affine": false,
   "qk_norm_bias": false,
