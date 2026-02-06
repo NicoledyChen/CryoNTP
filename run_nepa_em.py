@@ -293,6 +293,59 @@ class EMTilingDataset(Dataset):
 
 
 # ====================================================================
+# Pre-tiled dataset (fast — each file is one tile, no big-image I/O)
+# ====================================================================
+
+class PretiledDataset(Dataset):
+    """Ultra-fast dataset that reads pre-cut tile JPEGs.
+
+    Use after running ``pretile_em_data.py`` which converts large
+    micrographs into individual tile files.  Each ``__getitem__``
+    opens a single small JPEG (~50 Kpx) instead of decoding a full
+    micrograph (~56 Mpx), giving ~1000× I/O speed-up.
+
+    Parameters
+    ----------
+    tile_dir : str
+        Directory containing tile JPEG files.
+    transform : callable or None
+        Torchvision transform applied to each tile.
+    to_rgb : bool
+        Convert grayscale to 3-channel RGB.
+    """
+
+    def __init__(self, tile_dir: str, transform=None, to_rgb: bool = True):
+        super().__init__()
+        self.transform = transform
+        self.to_rgb = to_rgb
+
+        self.tile_paths = sorted([
+            str(p) for p in Path(tile_dir).iterdir()
+            if p.is_file() and p.suffix.lower() in EM_EXTENSIONS
+        ])
+        if not self.tile_paths:
+            raise FileNotFoundError(f"No tile images found in {tile_dir}")
+        logger.info(f"PretiledDataset: {len(self.tile_paths)} tiles from {tile_dir}")
+
+    def __len__(self) -> int:
+        return len(self.tile_paths)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        img = Image.open(self.tile_paths[idx])
+
+        # Handle non-standard modes (shouldn't happen for pre-tiled JPEGs, but be safe)
+        if img.mode not in ("L", "RGB"):
+            img = img.convert("L")
+
+        if self.to_rgb and img.mode == "L":
+            img = img.convert("RGB")
+
+        if self.transform is not None:
+            img = self.transform(img)
+        return {"pixel_values": img}
+
+
+# ====================================================================
 # EM-specific augmentations
 # ====================================================================
 
@@ -551,6 +604,16 @@ class DataTrainingArguments:
         default=False,
         metadata={"help": "Apply an additional RandomResizedCrop on top of each tile for extra jitter."},
     )
+    pretiled: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, image_dir / val_image_dir contain pre-cut tile JPEGs "
+                "(from pretile_em_data.py).  ~1000× faster data loading — no "
+                "large-image decoding at training time."
+            )
+        },
+    )
 
 
 @dataclass
@@ -716,26 +779,44 @@ def main():
     val_tf = build_val_transforms(tile_size=data_args.tile_size)
 
     # ---- Datasets ----
-    train_dataset = EMTilingDataset(
-        image_dir=data_args.image_dir,
-        tile_size=data_args.tile_size,
-        tile_overlap=data_args.tile_overlap,
-        random_crop=data_args.random_crop,
-        num_random_crops=data_args.num_random_crops,
-        transform=train_tf,
-        to_rgb=(config.num_channels == 3),
-    )
+    is_rgb = (config.num_channels == 3)
 
-    val_dataset = None
-    if data_args.val_image_dir is not None:
-        val_dataset = EMTilingDataset(
-            image_dir=data_args.val_image_dir,
-            tile_size=data_args.tile_size,
-            tile_overlap=0.0,   # no overlap for deterministic val
-            random_crop=False,
-            transform=val_tf,
-            to_rgb=(config.num_channels == 3),
+    if data_args.pretiled:
+        # Fast path: each file is one tile, no large-image decoding
+        logger.info("Using PretiledDataset (fast mode)")
+        train_dataset = PretiledDataset(
+            tile_dir=data_args.image_dir,
+            transform=train_tf,
+            to_rgb=is_rgb,
         )
+        val_dataset = None
+        if data_args.val_image_dir is not None:
+            val_dataset = PretiledDataset(
+                tile_dir=data_args.val_image_dir,
+                transform=val_tf,
+                to_rgb=is_rgb,
+            )
+    else:
+        # Standard path: tile large images on-the-fly
+        train_dataset = EMTilingDataset(
+            image_dir=data_args.image_dir,
+            tile_size=data_args.tile_size,
+            tile_overlap=data_args.tile_overlap,
+            random_crop=data_args.random_crop,
+            num_random_crops=data_args.num_random_crops,
+            transform=train_tf,
+            to_rgb=is_rgb,
+        )
+        val_dataset = None
+        if data_args.val_image_dir is not None:
+            val_dataset = EMTilingDataset(
+                image_dir=data_args.val_image_dir,
+                tile_size=data_args.tile_size,
+                tile_overlap=0.0,   # no overlap for deterministic val
+                random_crop=False,
+                transform=val_tf,
+                to_rgb=is_rgb,
+            )
 
     logger.info(f"Train samples: {len(train_dataset)}")
     if val_dataset is not None:
