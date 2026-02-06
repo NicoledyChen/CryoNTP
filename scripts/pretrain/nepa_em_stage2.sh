@@ -22,7 +22,7 @@ set -euo pipefail
 DATA_DIR="/data/em_nepa/train"               # source micrographs
 VAL_DIR="/data/em_nepa/val"
 CONFIG="configs/pretrain/nepa-base-patch14-em"
-STAGE1_CKPT="/data/ckpt/em_stage1"
+STAGE1_CKPT="/data/ckpt/em_stage1/checkpoint-7400"
 BASE_OUTPUT="/data/ckpt/em_stage2"
 TILE_BASE="/data/em_nepa"                    # pre-tiled data root
 
