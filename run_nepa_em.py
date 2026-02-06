@@ -688,50 +688,56 @@ class EmbeddingVisCallback(transformers.TrainerCallback):
         return img
 
     @staticmethod
-    def _compute_patch_attention_heatmap(
+    def _compute_query_attention_grid(
         attentions: tuple[torch.Tensor, ...],
+        query_token: int,
         patch_start: int,
-        img_size: tuple[int, int],
-        is_causal: bool,
+        grid_h: int,
+        grid_w: int,
         last_n_layers: int,
     ) -> torch.Tensor:
-        """Compute DINO-style attention heatmap adapted for causal NEPA.
+        """NEPA-style attention map for a selected query token.
 
-        DINO uses CLS-to-patch attention. For causal NEPA, CLS at position 0 cannot
-        attend to later patches, so we aggregate patch-to-patch received attention.
+        Average selected layers and heads, then take attention row for the
+        chosen query token over spatial patch tokens.
         """
+        n_layers = len(attentions)
+        n = max(1, min(last_n_layers, n_layers))
+        selected = attentions[-n:]  # tuple([B, H, T, T], ...)
+        att = torch.stack(selected, dim=0).mean(dim=0)  # [B, H, T, T]
+        att = att.mean(dim=1)  # [B, T, T]
+        att_vec = att[:, query_token, patch_start:]  # [B, P]
+        return att_vec.view(att_vec.shape[0], grid_h, grid_w)
+
+    @staticmethod
+    def _compute_query_prob_grid(
+        outputs,
+        query_token: int,
+        patch_start: int,
+        grid_h: int,
+        grid_w: int,
+    ) -> torch.Tensor:
+        """NEPA hidden-input probability grid for selected query token."""
         import torch.nn.functional as F
 
-        selected = attentions[-max(1, min(last_n_layers, len(attentions))) :]
-        per_layer_maps = []
-        for attn in selected:
-            # attn: [B, heads, tokens, tokens]
-            attn_mean = attn.mean(dim=1)  # [B, tokens, tokens]
-            patch_attn = attn_mean[:, patch_start:, patch_start:]  # [B, P, P]
-            # Heat per key patch = how much other patch queries attend to it.
-            heat = patch_attn.mean(dim=1)  # [B, P]
+        h_pred = outputs.last_hidden_state  # [B, T, D]
+        e_in = outputs.input_embedding      # [B, T, D]
+        h = h_pred[:, query_token, :]       # [B, D]
 
-            if is_causal:
-                # Causal bias correction: early keys are visible to more queries.
-                p = patch_attn.shape[-1]
-                exposure = torch.arange(
-                    p, 0, -1, device=heat.device, dtype=heat.dtype
-                ).unsqueeze(0)
-                heat = heat / (exposure + 1e-6)
+        e = F.normalize(e_in[:, patch_start:, :], dim=-1)      # [B, P, D]
+        h = F.normalize(h.unsqueeze(1), dim=-1)                # [B, 1, D]
+        sim = (e * h).sum(dim=-1)                              # [B, P]
+        prob = torch.softmax(sim, dim=-1)                      # [B, P]
+        return prob.view(prob.shape[0], grid_h, grid_w)
 
-            per_layer_maps.append(heat)
-
-        heat = torch.stack(per_layer_maps, dim=0).mean(dim=0)  # [B, P]
-        heat = heat - heat.min(dim=1, keepdim=True).values
-        heat = heat / (heat.max(dim=1, keepdim=True).values + 1e-6)
-
-        num_patches = heat.shape[-1]
-        side = int(np.sqrt(num_patches))
-        heat = heat.view(heat.shape[0], 1, side, side)
-        heat = F.interpolate(
-            heat, size=img_size, mode="bilinear", align_corners=False
-        )[:, 0]
-        return heat
+    @staticmethod
+    def _normalize_map(arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr, dtype=np.float32)
+        arr = arr - arr.min()
+        den = arr.max()
+        if den > 1e-8:
+            arr = arr / den
+        return arr
 
     @torch.no_grad()
     def _visualize_attention_and_log(
@@ -749,13 +755,14 @@ class EmbeddingVisCallback(transformers.TrainerCallback):
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
+            import matplotlib.patches as patches
         except ImportError:
-            logger.warning("matplotlib not installed, skipping attention heatmaps.")
+            logger.warning("matplotlib not installed, skipping NEPA token maps.")
             return
 
         dataset_ids = self._get_dataset_ids()
         vit = model.vit_nepa if hasattr(model, "vit_nepa") else model
-        is_causal = bool(getattr(vit.config, "is_causal", False))
+        patch_size = int(vit.config.patch_size)
 
         records = []
         batch_size = max(1, self.attention_batch_size)
@@ -770,64 +777,124 @@ class EmbeddingVisCallback(transformers.TrainerCallback):
                 logger.warning("No attention tensors returned; skipping attention maps.")
                 return
 
-            num_patches = (pixels.shape[-2] // vit.config.patch_size) * (pixels.shape[-1] // vit.config.patch_size)
-            patch_start = out.attentions[0].shape[-1] - num_patches
-            heatmaps = self._compute_patch_attention_heatmap(
-                attentions=out.attentions,
-                patch_start=patch_start,
-                img_size=(pixels.shape[-2], pixels.shape[-1]),
-                is_causal=is_causal,
-                last_n_layers=self.attention_last_n_layers,
-            )
-
             for k, ds_idx in enumerate(batch_idx):
                 img = self._to_vis_image(pixels[k])
-                heat = heatmaps[k].detach().cpu().numpy()
+                h_img, w_img = pixels[k].shape[-2], pixels[k].shape[-1]
+                grid_h, grid_w = h_img // patch_size, w_img // patch_size
+                num_patches = grid_h * grid_w
+                patch_start = out.attentions[0].shape[-1] - num_patches
+
+                # Match NEPA run_visualization: pick one random query patch per sample.
+                rng = random.Random(step * 1_000_003 + int(ds_idx))
+                q_r = rng.randint(0, grid_h - 1)
+                q_c = rng.randint(0, grid_w - 1)
+                query_token = patch_start + q_r * grid_w + q_c
+
+                att_grid = self._compute_query_attention_grid(
+                    attentions=out.attentions,
+                    query_token=query_token,
+                    patch_start=patch_start,
+                    grid_h=grid_h,
+                    grid_w=grid_w,
+                    last_n_layers=self.attention_last_n_layers,
+                )[k].detach().cpu().numpy()
+
+                prob_grid = self._compute_query_prob_grid(
+                    outputs=out,
+                    query_token=query_token,
+                    patch_start=patch_start,
+                    grid_h=grid_h,
+                    grid_w=grid_w,
+                )[k].detach().cpu().numpy()
+
                 label = dataset_ids[ds_idx] if ds_idx < len(dataset_ids) else "unknown"
-                records.append((img, heat, label, ds_idx))
+                records.append((img, att_grid, prob_grid, label, ds_idx, q_r, q_c, grid_h, grid_w))
 
         if not records:
             return
 
-        n = len(records)
-        n_cols = min(4, n)
-        n_rows = int(np.ceil(n / n_cols))
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.8 * n_cols, 4.2 * n_rows))
-        axes = np.array(axes).reshape(-1)
+        # One row per sample: [image | query patch | attention map | prob map]
+        n_rows = len(records)
+        fig, axes = plt.subplots(n_rows, 4, figsize=(18, 4.2 * n_rows))
+        if n_rows == 1:
+            axes = np.array([axes])
 
-        for ax in axes:
-            ax.axis("off")
+        for row, (img, att_grid, prob_grid, label, ds_idx, q_r, q_c, grid_h, grid_w) in enumerate(records):
+            h_img, w_img = img.shape[0], img.shape[1]
+            cell_w = w_img / grid_w
+            cell_h = h_img / grid_h
 
-        for i, (img, heat, label, ds_idx) in enumerate(records):
-            ax = axes[i]
-            ax.imshow(img, cmap="gray")
-            ax.imshow(heat, cmap="inferno", alpha=0.45, vmin=0.0, vmax=1.0)
-            ax.set_title(f"id={label} idx={ds_idx}", fontsize=9)
-            ax.axis("off")
+            ax0, ax1, ax2, ax3 = axes[row]
 
-        fig.suptitle(
-            f"Val Attention Heatmaps (DINO-style, adapted) — step {step}",
-            fontsize=13,
-            y=1.01,
-        )
+            # Original
+            ax0.imshow(img, cmap="gray")
+            ax0.set_title(f"id={label} idx={ds_idx}", fontsize=9)
+            ax0.axis("off")
+
+            # Query patch box
+            ax1.imshow(img, cmap="gray")
+            rect = patches.Rectangle(
+                (q_c * cell_w, q_r * cell_h),
+                cell_w, cell_h,
+                linewidth=2.0,
+                edgecolor="red",
+                facecolor="none",
+            )
+            ax1.add_patch(rect)
+            ax1.set_title(f"Query patch (r={q_r}, c={q_c})", fontsize=9)
+            ax1.axis("off")
+
+            # Attention map for query token
+            att_vis = np.power(self._normalize_map(att_grid), 0.5)
+            ax2.imshow(img, cmap="gray")
+            ax2.imshow(
+                att_vis,
+                cmap="inferno",
+                alpha=0.55,
+                extent=(0, w_img, h_img, 0),
+                interpolation="nearest",
+            )
+            ax2.set_title("Attention map", fontsize=9)
+            ax2.axis("off")
+
+            # Hidden-input probability map (NEPA)
+            prob_vis = np.power(self._normalize_map(prob_grid), 0.5)
+            ax3.imshow(img, cmap="gray")
+            ax3.imshow(
+                prob_vis,
+                cmap="viridis",
+                alpha=0.55,
+                extent=(0, w_img, h_img, 0),
+                interpolation="nearest",
+            )
+            ax3.set_title("Embedding probability map", fontsize=9)
+            ax3.axis("off")
+
+        fig.suptitle(f"Val NEPA Token Maps — step {step}", fontsize=13, y=1.01)
         fig.tight_layout()
 
         vis_dir = os.path.join(output_dir, "vis")
         os.makedirs(vis_dir, exist_ok=True)
-        attn_path = os.path.join(vis_dir, f"attention_maps_step{step}.png")
+        attn_path = os.path.join(vis_dir, f"nepa_maps_step{step}.png")
         fig.savefig(attn_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
-        logger.info(f"Saved attention heatmaps → {attn_path}")
+        logger.info(f"Saved NEPA token maps → {attn_path}")
 
         try:
             import wandb
             if wandb.run is not None:
-                wandb.log({"val/attention_maps": wandb.Image(attn_path)}, step=step)
-                logger.info("Logged attention heatmaps to wandb")
+                wandb.log(
+                    {
+                        "val/nepa_maps": wandb.Image(attn_path),
+                        "val/attention_maps": wandb.Image(attn_path),
+                    },
+                    step=step,
+                )
+                logger.info("Logged NEPA token maps to wandb")
         except ImportError:
             pass
         except Exception as e:
-            logger.warning(f"Failed to log attention maps to wandb: {e}")
+            logger.warning(f"Failed to log NEPA token maps to wandb: {e}")
 
     @staticmethod
     def _make_scatter(ax, coords_2d, labels, unique_labels, cmap, label_to_idx, title):
@@ -1057,15 +1124,15 @@ class DataTrainingArguments:
     )
     vis_attention_maps: bool = field(
         default=True,
-        metadata={"help": "Also generate DINO-style attention heatmaps during embedding visualisation."},
+        metadata={"help": "Also generate NEPA token maps (query patch + attention + prob) during visualisation."},
     )
     vis_attention_n_samples: int = field(
         default=8,
-        metadata={"help": "Number of val tiles for attention heatmaps per visualisation step."},
+        metadata={"help": "Number of val tiles for NEPA token-map visualisation per step."},
     )
     vis_attention_last_n_layers: int = field(
         default=4,
-        metadata={"help": "Average attention over the last N transformer layers for heatmaps."},
+        metadata={"help": "Average attention over the last N transformer layers for NEPA attention map."},
     )
     vis_attention_batch_size: int = field(
         default=1,
@@ -1295,7 +1362,7 @@ def main():
         )
         logger.info(
             f"Embedding visualisation enabled: every {data_args.vis_every_steps} steps, "
-            f"{data_args.vis_n_samples} samples, attention_maps={data_args.vis_attention_maps} "
+            f"{data_args.vis_n_samples} samples, nepa_maps={data_args.vis_attention_maps} "
             f"(n={data_args.vis_attention_n_samples}, last_layers={data_args.vis_attention_last_n_layers}, "
             f"attn_bs={data_args.vis_attention_batch_size}) "
             f"→ {{output_dir}}/vis/"
