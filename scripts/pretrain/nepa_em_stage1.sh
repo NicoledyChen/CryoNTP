@@ -27,7 +27,7 @@ TILE_OVERLAP=0.0                     # 0.0 = no overlap;  0.5 = 50 % overlap
 
 # ---------- Training ----------
 EPOCHS=300
-BATCH_PER_GPU=1024                     # per-device batch size
+BATCH_PER_GPU=256                     # per-device batch size
 ACCUM=1                              # gradient accumulation steps
 LR=1.5e-4                            # base learning rate
 EMBED_LR=5e-5                        # separate LR for patch-embedding layer
