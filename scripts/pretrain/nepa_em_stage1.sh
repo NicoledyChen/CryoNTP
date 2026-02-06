@@ -120,4 +120,6 @@ torchrun --nproc_per_node=${NUM_GPUS} run_nepa_em.py \
     --logging_steps 50 \
     --report_to wandb \
     --pos_embed_rescale 3.0 \
-    --visualize_embeddings
+    --visualize_embeddings \
+    --vis_every_steps 200 \
+    --vis_n_samples 2000
