@@ -34,9 +34,9 @@ TILE_WORKERS=128                             # CPUs for pre-tiling
 # Format:  "resolution:batch:workers:epochs:lr"
 # Batch & workers tuned per resolution for H100 80GB memory.
 PHASES=(
-    "336:64:16:100:1e-4"
-    "448:32:12:100:5e-5"
-    "672:8:8:50:2e-5"
+    "336:128:16:100:1e-4"
+    "448:64:12:100:5e-5"
+    "672:16:8:50:2e-5"
 )
 
 ACCUM=4
