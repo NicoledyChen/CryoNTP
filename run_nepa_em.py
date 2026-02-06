@@ -530,6 +530,24 @@ class EMTrainer(Trainer):
                 out.metrics.update(ema_out.metrics)
         return out
 
+    # -- eval loss fix (NEPA has no labels, but loss is intrinsic) --------
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """Override to always capture loss.
+
+        The default Trainer skips loss collection when there are no labels.
+        NEPA computes loss internally from next-embedding prediction, so we
+        always extract it from the model output.
+        """
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            with self.compute_loss_context_manager():
+                outputs = model(**inputs)
+            loss = outputs.loss
+            if loss is not None:
+                loss = loss.mean().detach()
+        return (loss, None, None)
+
     # -- checkpoint save / load with EMA --------------------------------
 
     def save_model(self, output_dir=None, _internal_call=False):
@@ -557,6 +575,226 @@ class EMTrainer(Trainer):
                     )
             else:
                 logger.info("[EMA] No ema checkpoint found, starting fresh.")
+
+
+# ====================================================================
+# Embedding visualisation callback
+# ====================================================================
+
+class EmbeddingVisCallback(transformers.TrainerCallback):
+    """Periodically extract embeddings from val tiles and save UMAP/t-SNE plots.
+
+    Visualisation is saved to ``{output_dir}/vis/embeddings_step{N}.png``.
+    Tiles are coloured by their source dataset (EMPIAR ID parsed from filename).
+
+    Parameters
+    ----------
+    val_dataset : Dataset
+        Validation dataset (PretiledDataset or EMTilingDataset).
+    n_samples : int
+        Number of tiles to sample for the plot.
+    every_steps : int
+        Run visualisation every N training steps.
+    """
+
+    def __init__(self, val_dataset, n_samples: int = 2000, every_steps: int = 2000):
+        super().__init__()
+        self.val_dataset = val_dataset
+        self.n_samples = n_samples
+        self.every_steps = every_steps
+
+    def _get_dataset_ids(self) -> list[str]:
+        """Try to extract dataset ID from tile filenames (e.g. '10005_xxx.jpg' → '10005')."""
+        ids = []
+        ds = self.val_dataset
+        if hasattr(ds, "tile_paths"):
+            paths = ds.tile_paths
+        elif hasattr(ds, "image_paths"):
+            paths = ds.image_paths
+        else:
+            return ["unknown"] * len(ds)
+
+        for p in paths:
+            name = os.path.basename(p)
+            # Expect format: {dataset_id}_{rest}.jpg
+            parts = name.split("_", 1)
+            ids.append(parts[0] if parts[0].isdigit() else "unknown")
+        return ids
+
+    @torch.no_grad()
+    def _extract_embeddings(self, model, device) -> tuple:
+        """Run a subset of val tiles through the model, return (embeddings, dataset_ids)."""
+        import torch.nn.functional as F
+
+        dataset_ids = self._get_dataset_ids()
+        n = min(self.n_samples, len(self.val_dataset))
+
+        # Deterministic subset
+        rng = random.Random(0)
+        indices = rng.sample(range(len(self.val_dataset)), n)
+
+        embeddings = []
+        labels = []
+        model.eval()
+
+        batch_size = 64
+        for start in range(0, len(indices), batch_size):
+            batch_idx = indices[start : start + batch_size]
+            pixels = torch.stack([
+                self.val_dataset[i]["pixel_values"] for i in batch_idx
+            ]).to(device)
+
+            # Forward through the base ViT model (not the pretraining head)
+            vit = model.vit_nepa if hasattr(model, "vit_nepa") else model
+            out = vit(pixel_values=pixels)
+            hidden = out.last_hidden_state  # [B, seq_len, D]
+
+            # Mean-pool patch tokens (exclude CLS at position 0)
+            patch_emb = hidden[:, 1:, :].mean(dim=1)  # [B, D]
+            patch_emb = F.normalize(patch_emb, dim=-1)
+            embeddings.append(patch_emb.cpu())
+
+            for i in batch_idx:
+                labels.append(dataset_ids[i] if i < len(dataset_ids) else "unknown")
+
+        embeddings = torch.cat(embeddings, dim=0).numpy()
+        return embeddings, labels
+
+    @staticmethod
+    def _make_scatter(ax, coords_2d, labels, unique_labels, cmap, label_to_idx, title):
+        """Draw one scatter subplot."""
+        for label in unique_labels:
+            mask = [i for i, l in enumerate(labels) if l == label]
+            ax.scatter(
+                coords_2d[mask, 0], coords_2d[mask, 1],
+                c=[cmap(label_to_idx[label])],
+                label=label, s=6, alpha=0.6,
+            )
+        ax.set_title(title, fontsize=11)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    def _visualize_and_log(self, embeddings, labels, step: int, output_dir: str):
+        """Run UMAP + t-SNE, save side-by-side plot, and log to wandb."""
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logger.warning("matplotlib not installed, skipping embedding visualisation.")
+            return
+
+        # ---- PCA pre-reduction (speed up UMAP / t-SNE) ----
+        emb = embeddings
+        try:
+            from sklearn.decomposition import PCA
+            if emb.shape[1] > 50:
+                emb = PCA(n_components=50, random_state=0).fit_transform(emb)
+        except ImportError:
+            pass
+
+        # ---- Compute both projections ----
+        projections: dict[str, np.ndarray] = {}
+
+        try:
+            from umap import UMAP
+            projections["UMAP"] = UMAP(
+                n_components=2, random_state=0, n_neighbors=15, min_dist=0.1,
+            ).fit_transform(emb)
+        except ImportError:
+            logger.info("umap-learn not installed, skipping UMAP.")
+
+        try:
+            from sklearn.manifold import TSNE
+            projections["t-SNE"] = TSNE(
+                n_components=2, random_state=0, perplexity=30,
+            ).fit_transform(emb)
+        except ImportError:
+            logger.info("sklearn not installed, skipping t-SNE.")
+
+        if not projections:
+            logger.warning("No dimensionality reduction available, skipping plot.")
+            return
+
+        # ---- Shared colour mapping ----
+        unique_labels = sorted(set(labels))
+        cmap = plt.cm.get_cmap("tab20", max(len(unique_labels), 1))
+        label_to_idx = {l: i for i, l in enumerate(unique_labels)}
+
+        n_plots = len(projections)
+        fig, axes = plt.subplots(1, n_plots, figsize=(10 * n_plots, 8))
+        if n_plots == 1:
+            axes = [axes]
+
+        for ax, (method, coords) in zip(axes, projections.items()):
+            self._make_scatter(
+                ax, coords, labels, unique_labels, cmap, label_to_idx,
+                title=f"Val Embeddings — {method} — step {step}",
+            )
+
+        # Shared legend on the rightmost subplot
+        axes[-1].legend(
+            loc="center left", bbox_to_anchor=(1.02, 0.5),
+            markerscale=3, fontsize=7, ncol=1,
+        )
+
+        fig.suptitle(f"Step {step}", fontsize=13, y=1.01)
+        fig.tight_layout()
+
+        # ---- Save locally ----
+        vis_dir = os.path.join(output_dir, "vis")
+        os.makedirs(vis_dir, exist_ok=True)
+        local_path = os.path.join(vis_dir, f"embeddings_step{step}.png")
+        fig.savefig(local_path, dpi=150, bbox_inches="tight")
+        logger.info(f"Saved embedding plot → {local_path}")
+
+        # ---- Log to wandb ----
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.log(
+                    {"val/embedding_plot": wandb.Image(fig)},
+                    step=step,
+                )
+                # Also log individual projections as separate wandb images
+                for method, coords in projections.items():
+                    fig_single, ax_single = plt.subplots(1, 1, figsize=(10, 8))
+                    self._make_scatter(
+                        ax_single, coords, labels, unique_labels,
+                        cmap, label_to_idx,
+                        title=f"{method} — step {step}",
+                    )
+                    ax_single.legend(
+                        loc="center left", bbox_to_anchor=(1.02, 0.5),
+                        markerscale=3, fontsize=7, ncol=1,
+                    )
+                    fig_single.tight_layout()
+                    wandb.log(
+                        {f"val/embedding_{method.lower().replace('-', '_')}": wandb.Image(fig_single)},
+                        step=step,
+                    )
+                    plt.close(fig_single)
+                logger.info(f"Logged embeddings to wandb (step {step})")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to log to wandb: {e}")
+
+        plt.close(fig)
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if state.global_step % self.every_steps != 0 or state.global_step == 0:
+            return
+        if model is None:
+            return
+        # Only run on main process
+        if args.local_rank not in (-1, 0):
+            return
+
+        logger.info(f"[EmbeddingVis] Extracting embeddings at step {state.global_step}...")
+        device = next(model.parameters()).device
+        embeddings, labels = self._extract_embeddings(model, device)
+        self._visualize_and_log(embeddings, labels, state.global_step, args.output_dir)
 
 
 # ====================================================================
@@ -613,6 +851,18 @@ class DataTrainingArguments:
                 "large-image decoding at training time."
             )
         },
+    )
+    visualize_embeddings: bool = field(
+        default=False,
+        metadata={"help": "Save UMAP/t-SNE of val embeddings during training (coloured by dataset)."},
+    )
+    vis_every_steps: int = field(
+        default=2000,
+        metadata={"help": "How often (in steps) to generate embedding visualisation."},
+    )
+    vis_n_samples: int = field(
+        default=2000,
+        metadata={"help": "Number of val tiles to use for embedding visualisation."},
     )
 
 
@@ -822,6 +1072,21 @@ def main():
     if val_dataset is not None:
         logger.info(f"Val   samples: {len(val_dataset)}")
 
+    # ---- Callbacks ----
+    callbacks = []
+    if data_args.visualize_embeddings and val_dataset is not None:
+        callbacks.append(
+            EmbeddingVisCallback(
+                val_dataset=val_dataset,
+                n_samples=data_args.vis_n_samples,
+                every_steps=data_args.vis_every_steps,
+            )
+        )
+        logger.info(
+            f"Embedding visualisation enabled: every {data_args.vis_every_steps} steps, "
+            f"{data_args.vis_n_samples} samples → {{output_dir}}/vis/"
+        )
+
     # ---- Trainer ----
     trainer = EMTrainer(
         model=model,
@@ -832,6 +1097,7 @@ def main():
         embed_lr=model_args.embed_lr,
         use_ema=model_args.use_ema,
         ema_decay=model_args.ema_decay,
+        callbacks=callbacks,
     )
 
     # ---- Train ----
