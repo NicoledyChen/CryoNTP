@@ -597,11 +597,30 @@ class EmbeddingVisCallback(transformers.TrainerCallback):
         Run visualisation every N training steps.
     """
 
-    def __init__(self, val_dataset, n_samples: int = 2000, every_steps: int = 2000):
+    def __init__(
+        self,
+        val_dataset,
+        n_samples: int = 2000,
+        every_steps: int = 2000,
+        enable_attention_maps: bool = True,
+        attention_n_samples: int = 8,
+        attention_last_n_layers: int = 4,
+    ):
         super().__init__()
         self.val_dataset = val_dataset
         self.n_samples = n_samples
         self.every_steps = every_steps
+        self.enable_attention_maps = enable_attention_maps
+        self.attention_n_samples = attention_n_samples
+        self.attention_last_n_layers = attention_last_n_layers
+
+    @staticmethod
+    def _sample_indices(dataset_len: int, n: int, seed: int) -> list[int]:
+        if dataset_len <= 0 or n <= 0:
+            return []
+        n = min(n, dataset_len)
+        rng = random.Random(seed)
+        return rng.sample(range(dataset_len), n)
 
     def _get_dataset_ids(self) -> list[str]:
         """Try to extract dataset ID from tile filenames (e.g. '10005_xxx.jpg' → '10005')."""
@@ -622,16 +641,13 @@ class EmbeddingVisCallback(transformers.TrainerCallback):
         return ids
 
     @torch.no_grad()
-    def _extract_embeddings(self, model, device) -> tuple:
+    def _extract_embeddings(self, model, device, indices: list[int]) -> tuple[np.ndarray, list[str]]:
         """Run a subset of val tiles through the model, return (embeddings, dataset_ids)."""
         import torch.nn.functional as F
 
         dataset_ids = self._get_dataset_ids()
-        n = min(self.n_samples, len(self.val_dataset))
-
-        # Deterministic subset
-        rng = random.Random(0)
-        indices = rng.sample(range(len(self.val_dataset)), n)
+        if not indices:
+            return np.empty((0, 0), dtype=np.float32), []
 
         embeddings = []
         labels = []
@@ -659,6 +675,157 @@ class EmbeddingVisCallback(transformers.TrainerCallback):
 
         embeddings = torch.cat(embeddings, dim=0).numpy()
         return embeddings, labels
+
+    @staticmethod
+    def _to_vis_image(pixel_values: torch.Tensor) -> np.ndarray:
+        """Convert normalized tensor (-1..1) to display-ready RGB numpy image (0..1)."""
+        img = pixel_values.detach().cpu().float().permute(1, 2, 0).numpy()
+        img = np.clip(img * 0.5 + 0.5, 0.0, 1.0)
+        if img.shape[-1] == 1:
+            img = np.repeat(img, 3, axis=-1)
+        return img
+
+    @staticmethod
+    def _compute_patch_attention_heatmap(
+        attentions: tuple[torch.Tensor, ...],
+        patch_start: int,
+        img_size: tuple[int, int],
+        is_causal: bool,
+        last_n_layers: int,
+    ) -> torch.Tensor:
+        """Compute DINO-style attention heatmap adapted for causal NEPA.
+
+        DINO uses CLS-to-patch attention. For causal NEPA, CLS at position 0 cannot
+        attend to later patches, so we aggregate patch-to-patch received attention.
+        """
+        import torch.nn.functional as F
+
+        selected = attentions[-max(1, min(last_n_layers, len(attentions))) :]
+        per_layer_maps = []
+        for attn in selected:
+            # attn: [B, heads, tokens, tokens]
+            attn_mean = attn.mean(dim=1)  # [B, tokens, tokens]
+            patch_attn = attn_mean[:, patch_start:, patch_start:]  # [B, P, P]
+            # Heat per key patch = how much other patch queries attend to it.
+            heat = patch_attn.mean(dim=1)  # [B, P]
+
+            if is_causal:
+                # Causal bias correction: early keys are visible to more queries.
+                p = patch_attn.shape[-1]
+                exposure = torch.arange(
+                    p, 0, -1, device=heat.device, dtype=heat.dtype
+                ).unsqueeze(0)
+                heat = heat / (exposure + 1e-6)
+
+            per_layer_maps.append(heat)
+
+        heat = torch.stack(per_layer_maps, dim=0).mean(dim=0)  # [B, P]
+        heat = heat - heat.min(dim=1, keepdim=True).values
+        heat = heat / (heat.max(dim=1, keepdim=True).values + 1e-6)
+
+        num_patches = heat.shape[-1]
+        side = int(np.sqrt(num_patches))
+        heat = heat.view(heat.shape[0], 1, side, side)
+        heat = F.interpolate(
+            heat, size=img_size, mode="bilinear", align_corners=False
+        )[:, 0]
+        return heat
+
+    @torch.no_grad()
+    def _visualize_attention_and_log(
+        self,
+        model,
+        device,
+        indices: list[int],
+        step: int,
+        output_dir: str,
+    ) -> None:
+        if not indices:
+            return
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logger.warning("matplotlib not installed, skipping attention heatmaps.")
+            return
+
+        dataset_ids = self._get_dataset_ids()
+        vit = model.vit_nepa if hasattr(model, "vit_nepa") else model
+        is_causal = bool(getattr(vit.config, "is_causal", False))
+
+        records = []
+        batch_size = 8
+        for start in range(0, len(indices), batch_size):
+            batch_idx = indices[start : start + batch_size]
+            pixels = torch.stack([
+                self.val_dataset[i]["pixel_values"] for i in batch_idx
+            ]).to(device)
+
+            out = vit(pixel_values=pixels, output_attentions=True)
+            if out.attentions is None or len(out.attentions) == 0:
+                logger.warning("No attention tensors returned; skipping attention maps.")
+                return
+
+            num_patches = (pixels.shape[-2] // vit.config.patch_size) * (pixels.shape[-1] // vit.config.patch_size)
+            patch_start = out.attentions[0].shape[-1] - num_patches
+            heatmaps = self._compute_patch_attention_heatmap(
+                attentions=out.attentions,
+                patch_start=patch_start,
+                img_size=(pixels.shape[-2], pixels.shape[-1]),
+                is_causal=is_causal,
+                last_n_layers=self.attention_last_n_layers,
+            )
+
+            for k, ds_idx in enumerate(batch_idx):
+                img = self._to_vis_image(pixels[k])
+                heat = heatmaps[k].detach().cpu().numpy()
+                label = dataset_ids[ds_idx] if ds_idx < len(dataset_ids) else "unknown"
+                records.append((img, heat, label, ds_idx))
+
+        if not records:
+            return
+
+        n = len(records)
+        n_cols = min(4, n)
+        n_rows = int(np.ceil(n / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.8 * n_cols, 4.2 * n_rows))
+        axes = np.array(axes).reshape(-1)
+
+        for ax in axes:
+            ax.axis("off")
+
+        for i, (img, heat, label, ds_idx) in enumerate(records):
+            ax = axes[i]
+            ax.imshow(img, cmap="gray")
+            ax.imshow(heat, cmap="inferno", alpha=0.45, vmin=0.0, vmax=1.0)
+            ax.set_title(f"id={label} idx={ds_idx}", fontsize=9)
+            ax.axis("off")
+
+        fig.suptitle(
+            f"Val Attention Heatmaps (DINO-style, adapted) — step {step}",
+            fontsize=13,
+            y=1.01,
+        )
+        fig.tight_layout()
+
+        vis_dir = os.path.join(output_dir, "vis")
+        os.makedirs(vis_dir, exist_ok=True)
+        attn_path = os.path.join(vis_dir, f"attention_maps_step{step}.png")
+        fig.savefig(attn_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"Saved attention heatmaps → {attn_path}")
+
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.log({"val/attention_maps": wandb.Image(attn_path)}, step=step)
+                logger.info("Logged attention heatmaps to wandb")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to log attention maps to wandb: {e}")
 
     @staticmethod
     def _make_scatter(ax, coords_2d, labels, unique_labels, cmap, label_to_idx, title):
@@ -794,8 +961,29 @@ class EmbeddingVisCallback(transformers.TrainerCallback):
 
         logger.info(f"[EmbeddingVis] Extracting embeddings at step {state.global_step}...")
         device = next(model.parameters()).device
-        embeddings, labels = self._extract_embeddings(model, device)
-        self._visualize_and_log(embeddings, labels, state.global_step, args.output_dir)
+        was_training = model.training
+        model.eval()
+        try:
+            emb_indices = self._sample_indices(
+                dataset_len=len(self.val_dataset),
+                n=self.n_samples,
+                seed=0,
+            )
+            embeddings, labels = self._extract_embeddings(model, device, emb_indices)
+            self._visualize_and_log(embeddings, labels, state.global_step, args.output_dir)
+
+            if self.enable_attention_maps:
+                attn_indices = emb_indices[: self.attention_n_samples]
+                self._visualize_attention_and_log(
+                    model=model,
+                    device=device,
+                    indices=attn_indices,
+                    step=state.global_step,
+                    output_dir=args.output_dir,
+                )
+        finally:
+            if was_training:
+                model.train()
 
 
 # ====================================================================
@@ -864,6 +1052,18 @@ class DataTrainingArguments:
     vis_n_samples: int = field(
         default=2000,
         metadata={"help": "Number of val tiles to use for embedding visualisation."},
+    )
+    vis_attention_maps: bool = field(
+        default=True,
+        metadata={"help": "Also generate DINO-style attention heatmaps during embedding visualisation."},
+    )
+    vis_attention_n_samples: int = field(
+        default=8,
+        metadata={"help": "Number of val tiles for attention heatmaps per visualisation step."},
+    )
+    vis_attention_last_n_layers: int = field(
+        default=4,
+        metadata={"help": "Average attention over the last N transformer layers for heatmaps."},
     )
 
 
@@ -1081,11 +1281,16 @@ def main():
                 val_dataset=val_dataset,
                 n_samples=data_args.vis_n_samples,
                 every_steps=data_args.vis_every_steps,
+                enable_attention_maps=data_args.vis_attention_maps,
+                attention_n_samples=data_args.vis_attention_n_samples,
+                attention_last_n_layers=data_args.vis_attention_last_n_layers,
             )
         )
         logger.info(
             f"Embedding visualisation enabled: every {data_args.vis_every_steps} steps, "
-            f"{data_args.vis_n_samples} samples → {{output_dir}}/vis/"
+            f"{data_args.vis_n_samples} samples, attention_maps={data_args.vis_attention_maps} "
+            f"(n={data_args.vis_attention_n_samples}, last_layers={data_args.vis_attention_last_n_layers}) "
+            f"→ {{output_dir}}/vis/"
         )
 
     # ---- Trainer ----
