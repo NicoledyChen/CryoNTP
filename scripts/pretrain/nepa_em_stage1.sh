@@ -107,13 +107,15 @@ torchrun --nproc_per_node=${NUM_GPUS} run_nepa_em.py \
     --num_train_epochs ${EPOCHS} \
     --do_train \
     --do_eval \
-    --eval_strategy epoch \
+    --eval_strategy steps \
+    --eval_steps 200 \
     --bf16 \
     --tf32 true \
     --dataloader_num_workers ${WORKERS} \
     --dataloader_prefetch_factor ${PREFETCH} \
     --dataloader_persistent_workers true \
-    --save_strategy epoch \
+    --save_strategy steps \
+    --save_steps 200 \
     --save_total_limit 3 \
     --logging_steps 50 \
     --report_to wandb \
